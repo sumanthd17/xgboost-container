@@ -1,0 +1,120 @@
+from __future__ import print_function
+
+import os
+import json
+import pickle
+import sys
+import traceback
+
+import pandas as pd
+
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline, FeatureUnion
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.feature_selection import chi2, SelectKBest
+
+from xgboost import XGBClassifier, plot_importance
+
+prefix = '/opt/ml/'
+
+input_path = prefix + 'input/data'
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+param_path = os.path.join(prefix, 'input/config/hyperparameters.json')
+
+channel_name='training'
+training_path = os.path.join(input_path, channel_name)
+
+def train():
+    print('Starting the training.')
+    try:
+        # Read in any hyperparameters that the user passed with the training job
+        with open(param_path, 'r') as tc:
+            trainingParams = json.load(tc)
+
+        # Take the set of files and read them all into a single pandas dataframe
+        input_files = [ os.path.join(training_path, file) for file in os.listdir(training_path) ]
+        if len(input_files) == 0:
+            raise ValueError(('There are no files in {}.\n' +
+                              'This usually indicates that the channel ({}) was incorrectly specified,\n' +
+                              'the data specification in S3 was incorrectly specified or the role specified\n' +
+                              'does not have permission to access the data.').format(training_path, channel_name))
+        raw_data = [ pd.read_csv(file, header=None) for file in input_files ]
+        train_data = pd.concat(raw_data)
+
+        TOKENS_ALPHANUMERIC = '[A-Za-z0-9]+(?=\\s+)'
+        NUMERIC_COLUMNS = ['amount_amount']
+        CATEGORICAL_COLUMNS = ["account_type"]
+        TEXT_COLUMNS = ["description","customer_name","bank_account_name"]
+        LABEL = ["debit_category"]
+
+        def combine_text_columns(data_frame):
+            text_data = data_frame[TEXT_COLUMNS]
+            text_data = text_data.apply(lambda x: x.astype(str).str.lower())
+            text_data.fillna("", inplace=True)    
+            return text_data.apply(lambda x: " ".join(x), axis=1)
+
+        def numeric(df):
+            return df[NUMERIC_COLUMNS]
+
+        def cat_cols(df):
+            return df[CATEGORICAL_COLUMNS]
+
+        get_text_data = FunctionTransformer(combine_text_columns, validate=False)
+        get_numeric_data = FunctionTransformer(numeric, validate=False)
+        get_categorical_data = FunctionTransformer(cat_cols, validate=False)
+
+        chi_k = 300
+
+        plp = Pipeline([
+                ('union', FeatureUnion(
+                    transformer_list = [
+                        ('numeric_features', Pipeline([
+                            ('selector', get_numeric_data),
+                            ('imputer', SimpleImputer())
+                        ])),
+                        ('categorical_features', Pipeline([
+                            ('selector', get_categorical_data),
+                            ('imputer', SimpleImputer(strategy = 'most_frequent')),
+                            ('onehotencoder', OneHotEncoder())
+                        ])),
+                        ('text_features', Pipeline([
+                            ('selector', get_text_data),
+                            ('vectorizer', HashingVectorizer(token_pattern=TOKENS_ALPHANUMERIC,
+                                                            alternate_sign=False, norm=None,
+                                                            ngram_range=(1, 2))),
+                            ('dim_red', SelectKBest(chi2, chi_k))
+                        ]))
+                    ]
+                )),
+                ('scale', StandardScaler(with_mean = False)),
+                ('clf', XGBClassifier(n_jobs=-1))
+            ])
+
+        X = train_data.drop(LABEL, axis=1)
+        y = train_data['debit_category'].astype('category').cat.codes
+
+        plp = plp.fit(X, y.values)
+
+        # save the model
+        with open(os.path.join(model_path, 'xgboost.pkl'), 'w') as out:
+            pickle.dump(plp, out)
+        print('Training complete.')
+
+    except Exception as e:
+        # Write out an error file. This will be returned as the failureReason in the
+        # DescribeTrainingJob result.
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('Exception during training: ' + str(e) + '\n' + trc)
+        # Printing this causes the exception to be in the training job logs, as well.
+        print('Exception during training: ' + str(e) + '\n' + trc, file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        sys.exit(255)
+
+if __name__ == '__main__':
+    train()
+
+    # A zero exit code causes the job to be marked a Succeeded.
+    sys.exit(0)
